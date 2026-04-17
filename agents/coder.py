@@ -7,219 +7,144 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # ── THE BRAIN ──
-# Llama 3.1 70B via Groq — dramatically better code quality
-# than any 7B local model. Free tier: 30 req/min, 6000/day
+# Llama 3.3 70B via Groq — strong code generation quality
 # temperature=0 → deterministic, consistent output
 llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0,
-    max_tokens=4096  # enough for any single file
+    max_tokens=4096
 )
 
 # ── PROJECT ROOT ──
+# All generated files go inside this folder
+# Keeps the MERN app completely separate from agent code
 PROJECT_ROOT = "project"
 
-# ── FILE PLAN ──
-# Hardcoded for a simple MERN calculator
-# No auth, no JWT — just the core app
-# ── FILE PLAN ──
-FILE_PLAN = [
-    {
-        "path": "server/package.json",
-        "description": """package.json for Express server.
-MUST include "type": "module" to enable ES imports.
-name: calculator-server
-scripts.start: node app.js
-dependencies: express, mongoose, cors, dotenv
-Example:
-{
-  "name": "calculator-server",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": { "start": "node app.js" },
-  "dependencies": {
-    "express": "^4.18.2",
-    "mongoose": "^7.6.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.0.0"
-  }
-}"""
-    },
-    {
-        "path": "server/.env",
-        "description": """Environment file with exactly these two lines:
-PORT=5000
-MONGODB_URI=mongodb://localhost:27017/calculator"""
-    },
-    {
-        "path": "server/app.js",
-        "description": """Express app entry point using ES module imports.
-MUST start exactly like this:
-import express from 'express';
-import cors from 'cors';
-import mongoose from 'mongoose';
-import dotenv from 'dotenv';
-import calculationRoutes from './routes/calculationRoutes.js';
+# ── FILE PLAN PROMPT ──
+# Asks the LLM to decide which files need to be created
+# based on whatever architecture the Architect produced
+FILE_PLAN_PROMPT = """You are a MERN stack developer.
+Given an architecture specification, return a JSON array of files to create.
 
-dotenv.config();
-const app = express();
-const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/calculator';
-
-app.use(cors());
-app.use(express.json());
-app.use('/api/calculations', calculationRoutes);
-
-mongoose.connect(MONGODB_URI)
-  .then(() => {
-    console.log('MongoDB connected');
-    app.listen(PORT, () => console.log('Server running on port ' + PORT));
-  })
-  .catch(err => console.error('MongoDB error:', err));"""
-    },
-    {
-        "path": "server/models/Calculation.js",
-        "description": """Mongoose model using ES imports.
-MUST start with: import mongoose from 'mongoose';
-Schema: expression (String required), result (String required), createdAt (Date default Date.now)
-MUST end with: export default mongoose.model('Calculation', CalculationSchema);"""
-    },
-    {
-        "path": "server/routes/calculationRoutes.js",
-        "description": """Express router using ES imports.
-MUST start with:
-import { Router } from 'express';
-import Calculation from '../models/Calculation.js';
-const router = Router();
-
-POST / — create new Calculation({expression, result}), save, return json
-GET / — Calculation.find().sort({_id:-1}).limit(20), return json
-
-MUST end with: export default router;"""
-    },
-    {
-        "path": "client/package.json",
-        "description": """package.json for React client.
-name: calculator-client
-scripts.start: react-scripts start
-dependencies: react, react-dom, react-scripts, axios
-proxy: http://localhost:5000
-Example:
-{
-  "name": "calculator-client",
-  "version": "0.1.0",
-  "private": true,
-  "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-scripts": "5.0.1",
-    "axios": "^1.6.0"
+Return ONLY a JSON array in this exact format:
+[
+  {
+    "path": "server/package.json",
+    "description": "detailed description of what this file should contain"
   },
-  "scripts": { "start": "react-scripts start", "build": "react-scripts build" },
-  "proxy": "http://localhost:5000",
-  "browserslist": { "production": [">0.2%"], "development": ["last 1 chrome version"] }
-}"""
-    },
-    {
-        "path": "client/public/index.html",
-        "description": """Minimal HTML shell for React.
-Must have <div id="root"></div> in body.
-Title: MERN Calculator"""
-    },
-    {
-        "path": "client/src/index.js",
-        "description": """React entry point.
-import React from 'react';
-import ReactDOM from 'react-dom/client';
-import App from './App';
-import './App.css';
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<React.StrictMode><App /></React.StrictMode>);"""
-    },
-    {
-        "path": "client/src/App.js",
-        "description": """Main App component.
-import React, { useState } from 'react';
-import Calculator from './components/Calculator';
-import History from './components/History';
-
-export default function App() {
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
-  return (
-    <div className="app">
-      <Calculator onCalculation={() => setRefreshTrigger(r => r+1)} />
-      <History refreshTrigger={refreshTrigger} />
-    </div>
-  );
-}"""
-    },
-    {
-        "path": "client/src/components/Calculator.js",
-        "description": """Calculator component with a display div with id="calculator-display".
-IMPORTANT: The display div MUST have id="calculator-display" so tests can find it.
-Use useState for display string.
-Buttons: 7 8 9 / | 4 5 6 * | 1 2 3 - | 0 . C + | = (full width)
-On number/operator: append to display state
-On C: setDisplay('')
-On =: try { result = String(eval(display)); POST to /api/calculations via axios; props.onCalculation(); setDisplay(result); } catch { setDisplay('ERROR') }
-Use axios.post('/api/calculations', {expression: display, result})"""
-    },
-    {
-        "path": "client/src/components/History.js",
-        "description": """History component.
-Accept refreshTrigger prop.
-useEffect with [refreshTrigger] to fetch GET /api/calculations on mount and refresh.
-Display each item as: expression = result (timestamp)
-Use axios.get('/api/calculations')"""
-    },
-    {
-        "path": "client/src/App.css",
-        "description": """CSS for the calculator app.
-body: background #1a1a2e, color white, display flex, justify-content center, padding 40px
-.app: display flex, flex-direction row, gap 40px
-.calculator: background #16213e, padding 20px, border-radius 12px
-.display: background #0f3460, color white, font-size 24px, text-align right, padding 10px, margin-bottom 10px, min-height 50px, border-radius 8px
-.buttons: display grid, grid-template-columns repeat(4 1fr), gap 8px
-button: padding 15px, font-size 18px, background #e94560, color white, border none, border-radius 8px, cursor pointer
-button:hover: background #c73652
-.equals: grid-column 1 / 5, background #4ecca3
-.history: background #16213e, padding 20px, border-radius 12px, width 300px, max-height 500px, overflow-y auto"""
-    },
+  {
+    "path": "client/src/components/TodoList.js",
+    "description": "detailed description of what this file should contain"
+  }
 ]
 
-# ── SYSTEM PROMPT ──
-# Explicitly enforce ES modules and correct paths
-SYSTEM_PROMPT = """You are an expert MERN stack developer.
+Rules:
+- All server files must start with server/
+- All client files must start with client/
+- Always include server/package.json and client/package.json
+- Always include server/app.js as Express entry point
+- Always include client/src/index.js and client/src/App.js
+- Always include client/public/index.html
+- Include ALL components mentioned in the architecture
+- Include ALL routes mentioned in the architecture
+- Include ALL models mentioned in the architecture
+- Descriptions must be detailed enough to generate complete working code
+- Return ONLY the JSON array, no explanation
+"""
+
+# ── FILE GENERATION PROMPT ──
+# Strict rules to prevent the most common model mistakes:
+# wrong import paths, placeholder comments, missing code
+FILE_GENERATION_PROMPT = """You are an expert MERN stack developer.
 Generate COMPLETE, PRODUCTION-READY file content.
 
-STRICT RULES:
-1. ALWAYS use ES module syntax:
-   - import express from 'express'   ✓
-   - const express = require('express')  ✗ NEVER USE THIS
-2. ALWAYS use export default or export const
-   - export default router   ✓
-   - module.exports = router  ✗ NEVER USE THIS
-3. Import paths must be simple package names:
-   - import express from 'express'  ✓
-   - import express from '../node_modules/express'  ✗ NEVER
-4. Use exactly 2 spaces for indentation
-5. Write COMPLETE files — no TODOs, no placeholders
-6. Return ONLY raw file content — no markdown fences, no explanation
+STRICT RULES — violating any of these is unacceptable:
+1. Write the COMPLETE file — never truncate or summarize
+2. ALWAYS use ES module syntax:
+   - import express from 'express'          ✓
+   - const express = require('express')     ✗ never
+3. ALWAYS use ES module exports:
+   - export default router                  ✓
+   - module.exports = router               ✗ never
+4. Import paths must be package names only:
+   - import express from 'express'          ✓
+   - import express from '../node_modules/express'  ✗ never
+5. Use exactly 2 spaces for indentation
+6. No placeholder comments:
+   - // TODO, // add your code, // replace with  ✗ never
+7. For server/app.js ALWAYS include this health check route:
+   app.get('/', (req, res) => res.json({ status: 'ok' }))
+8. Return ONLY the raw file content
+9. No markdown fences, no explanation before or after
 """
+
+
+def generate_file_plan(architecture: str) -> list:
+    """
+    Asks the LLM to plan which files need to be created
+    based on the architecture spec.
+    Returns a list of {path, description} dicts.
+    This is the PERCEIVE step — understanding what needs building.
+    """
+    print("\nGenerating file plan from architecture...")
+
+    messages = [
+        SystemMessage(content=FILE_PLAN_PROMPT),
+        HumanMessage(content=f"Generate the file plan for this architecture:\n\n{architecture}")
+    ]
+
+    response = llm.invoke(
+        messages,
+        config={
+            "run_name": "Coder — File Plan",
+            "tags": ["coder", "parl", "planning"],
+            "metadata": {
+                "agent": "coder",
+                "step": "file_planning",
+                "model": "llama-3.3-70b-versatile"
+            }
+        }
+    )
+
+    raw = response.content.strip()
+
+    # Strip markdown fences if present
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    # Extract just the JSON array in case model added text around it
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start != -1 and end != 0:
+        raw = raw[start:end]
+
+    try:
+        file_plan = json.loads(raw)
+        print(f"  → Planned {len(file_plan)} files:")
+        for f in file_plan:
+            print(f"    - {f['path']}")
+        return file_plan
+    except json.JSONDecodeError as e:
+        print(f"  ✗ Could not parse file plan: {e}")
+        return []
+
 
 def generate_file_content(filepath: str, description: str) -> str:
     """
-    Generate complete content for a single file using Groq.
-    Includes a verification pass to catch placeholder comments.
+    Generates complete content for a single file.
+    Runs a verification pass if placeholder comments are detected.
+    This is the ACT step — producing the actual code.
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
-    # ── GENERATION PASS ──
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=FILE_GENERATION_PROMPT),
         HumanMessage(content=f"""Generate the COMPLETE content for this file.
+
 File path: {filepath}
 What this file does: {description}
 """)
@@ -238,22 +163,21 @@ What this file does: {description}
         }
     )
 
-
     content = response.content.strip()
 
-    # ── CLEAN OUTPUT ──
-    # Strip markdown fences even though we asked not to have them
-    # 70B models rarely add them but we handle it defensively
+    # ── STRIP MARKDOWN FENCES ──
+    # Models occasionally wrap output in ```javascript ... ```
+    # despite instructions — strip defensively
     if content.startswith("```"):
         lines = content.split("\n")
-        lines = lines[1:]  # remove opening fence
+        lines = lines[1:]
         if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]  # remove closing fence
+            lines = lines[:-1]
         content = "\n".join(lines).strip()
 
     # ── VERIFICATION PASS ──
-    # Check if the model still added placeholder comments
-    # If detected, run a second pass asking it to fix them
+    # If placeholder comments are detected run a fix pass
+    # This catches cases where the model ignored instructions
     placeholder_signals = [
         "// add your",
         "// replace with",
@@ -265,32 +189,30 @@ What this file does: {description}
         "implement here",
     ]
 
-    found_placeholders = [
-        p for p in placeholder_signals
-        if p.lower() in content.lower()
-    ]
+    found = [p for p in placeholder_signals if p.lower() in content.lower()]
 
-    if found_placeholders:
-        print(f"  ⚠ Placeholder detected ({found_placeholders[0]}), running fix pass...")
+    if found:
+        print(f"  ⚠ Placeholder detected ({found[0]}), running fix pass...")
 
         fix_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"""The following file has placeholder comments that need to be replaced with real code.
-Fix ALL placeholders and return the complete corrected file.
+            SystemMessage(content=FILE_GENERATION_PROMPT),
+            HumanMessage(content=f"""This file has placeholder comments.
+Replace ALL placeholders with real working code.
 
 File: {filepath}
 Description: {description}
 
-Current content with placeholders:
+Current content:
 {content}
 
 Return the complete fixed file with no placeholders.
 """)
         ]
+
         fix_response = llm.invoke(fix_messages)
         content = fix_response.content.strip()
 
-        # Clean fences again after fix pass
+        # Strip fences again after fix pass
         if content.startswith("```"):
             lines = content.split("\n")
             lines = lines[1:]
@@ -303,7 +225,8 @@ Return the complete fixed file with no placeholders.
 
 def save_file(relative_path: str, content: str) -> str:
     """
-    Save generated file into project/relative_path.
+    Saves generated file to project/relative_path.
+    Creates parent directories automatically.
     Returns the full saved path.
     """
     full_path = os.path.join(PROJECT_ROOT, relative_path)
@@ -315,24 +238,38 @@ def save_file(relative_path: str, content: str) -> str:
     return full_path
 
 
-def run_coder(architecture: str = None) -> list:
+def run_coder(architecture: str) -> list:
     """
     Runs the Coder agent.
-    Generates all files into project/ folder.
+    Reads the architecture spec and generates all MERN files.
+    Works for any app — not hardcoded to any specific project.
     Returns list of successfully created file paths.
     """
     print("\n" + "="*50)
     print("CODER AGENT STARTING")
-    print(f"Model : llama-3.1-70b-versatile via Groq")
-    print(f"Files : {len(FILE_PLAN)} files to generate")
-    print(f"Output: {PROJECT_ROOT}/")
     print("="*50)
+
+    # ── PERCEIVE ──
+    # Understand what files need to be built
+    file_plan = generate_file_plan(architecture)
+
+    if not file_plan:
+        print("✗ Could not generate file plan")
+        return []
+
+    print(f"\nModel  : llama-3.3-70b-versatile via Groq")
+    print(f"Files  : {len(file_plan)} to generate")
+    print(f"Output : {PROJECT_ROOT}/")
 
     created_files = []
     failed_files = []
-    total = len(FILE_PLAN)
+    total = len(file_plan)
 
-    for i, file_info in enumerate(FILE_PLAN, 1):
+    # ── REASON + ACT ──
+    # Generate each file one at a time
+    # Focused generation per file produces better quality
+    # than asking for everything at once
+    for i, file_info in enumerate(file_plan, 1):
         relative_path = file_info["path"]
         description = file_info["description"]
 
@@ -358,7 +295,8 @@ def run_coder(architecture: str = None) -> list:
             failed_files.append(relative_path)
             continue
 
-    # ── SUMMARY ──
+    # ── LEARN ──
+    # Report what was accomplished this iteration
     print("\n" + "="*50)
     print("CODER AGENT COMPLETE")
     print("="*50)
@@ -376,26 +314,23 @@ def run_coder(architecture: str = None) -> list:
         indent = "  " * level
         print(f"{indent}{os.path.basename(root)}/")
         subindent = "  " * (level + 1)
-        for file in files:
-            print(f"{subindent}{file}")
+        for filename in files:
+            print(f"{subindent}{filename}")
 
     return created_files
 
 
+# ── RUN DIRECTLY TO TEST ──
 if __name__ == "__main__":
     arch_path = os.path.join(PROJECT_ROOT, "architecture.md")
 
     if not os.path.exists(arch_path):
-        print(f"Error: {arch_path} not found.")
-        print("Run architect first: python agents/architect.py")
+        print(f"✗ {arch_path} not found.")
+        print("Run the Architect first: python agents/architect.py")
         sys.exit(1)
 
     with open(arch_path, 'r', encoding='utf-8') as f:
         architecture = f.read()
 
+    print(f"✓ Read architecture.md ({len(architecture)} chars)")
     run_coder(architecture)
-
-
-
-
-

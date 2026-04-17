@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import asyncio
-import subprocess
 import time
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,246 +13,56 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from playwright.async_api import async_playwright
 
 # ── THE BRAIN ──
+# Used for two tasks:
+# 1. Generating test scenarios from architecture
+# 2. Analyzing test results and producing failure reports
 llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0,
     max_tokens=2048
 )
 
-# ── TEST SCENARIOS ──
-# These are the specific user flows the Tester will verify
-# Each scenario has steps the agent will execute in order
-# For a calculator app we test basic arithmetic operations
-TEST_SCENARIOS = [
-    {
-        "name": "Addition Test",
-        "steps": ["2", "+", "3", "="],
-        "expected_result": "5",
-        "description": "Verify 2 + 3 = 5"
-    },
-    {
-        "name": "Subtraction Test",
-        "steps": ["9", "-", "4", "="],
-        "expected_result": "5",
-        "description": "Verify 9 - 4 = 5"
-    },
-    {
-        "name": "Multiplication Test",
-        "steps": ["3", "*", "4", "="],
-        "expected_result": "12",
-        "description": "Verify 3 * 4 = 12"
-    },
-    {
-        "name": "Division Test",
-        "steps": ["8", "/", "2", "="],
-        "expected_result": "4",
-        "description": "Verify 8 / 2 = 4"
-    },
-    {
-        "name": "Clear Test",
-        "steps": ["5", "+", "3", "C"],
-        "expected_result": "",
-        "description": "Verify Clear button resets display"
-    },
+# ── SCENARIO GENERATION PROMPT ──
+# Asks the LLM to produce a structured list of UI test actions
+# based on whatever app the Architect designed
+SCENARIO_GENERATION_PROMPT = """You are a QA engineer writing Playwright test scenarios.
+Given an architecture spec, generate UI test scenarios.
+
+Return ONLY a JSON array in this exact format:
+[
+  {
+    "name": "Test name",
+    "description": "what this test verifies",
+    "actions": [
+      {"type": "navigate", "url": "http://localhost:3000"},
+      {"type": "click", "selector": "button:has-text('Add')"},
+      {"type": "fill", "selector": "input[placeholder='Task name']", "value": "Buy groceries"},
+      {"type": "click", "selector": "button:has-text('Save')"},
+      {"type": "assert_text", "selector": ".task-list", "expected": "Buy groceries"}
+    ]
+  }
 ]
 
-# ── PLAYWRIGHT BROWSER ACTIONS ──
-# These are the actual browser control functions
-# The agent decides WHAT to test, Playwright decides HOW to do it
+Available action types:
+- navigate   : go to a URL               (fields: url)
+- click      : click an element          (fields: selector)
+- fill       : type into an input        (fields: selector, value)
+- assert_text: verify element has text   (fields: selector, expected)
+- assert_visible: verify element exists  (fields: selector)
+- wait       : pause execution           (fields: value in ms)
 
-async def get_page_state(page) -> dict:
-    """
-    Capture the current state of the calculator page.
-    This is the agent's PERCEPTION step — reading the UI.
-    Returns a dict with display value, buttons, and history.
-    """
-    try:
-        # Get the display value
-        display = await page.locator('[class*="display"], [class*="Display"], #display').first.inner_text()
-    except:
-        display = "NOT FOUND"
+Rules:
+- Use realistic selectors based on the architecture components
+- Test the core user flows described in the architecture
+- Generate 3-5 test scenarios covering the main features
+- Return ONLY the JSON array, no explanation
+"""
 
-    try:
-        # Get all button texts
-        buttons = await page.locator('button').all_inner_texts()
-    except:
-        buttons = []
-
-    try:
-        # Get history items if visible
-        history_items = await page.locator('[class*="history"] *').all_inner_texts()
-        history = history_items[:5]  # just first 5 items
-    except:
-        history = []
-
-    # Take a screenshot for the trace log
-    screenshot_path = f"logs/screenshot_{int(time.time())}.png"
-    os.makedirs("logs", exist_ok=True)
-    await page.screenshot(path=screenshot_path)
-
-    return {
-        "display": display.strip(),
-        "buttons_available": buttons,
-        "history_preview": history,
-        "screenshot": screenshot_path
-    }
-
-
-async def click_button(page, button_text: str) -> str:
-    """
-    Click a calculator button by its text content.
-    Returns confirmation or error message.
-    """
-    try:
-        # Find button by exact text match
-        button = page.locator(f'button:has-text("{button_text}")').first
-        await button.click()
-        await page.wait_for_timeout(300)  # small delay for UI to update
-        return f"Clicked button: {button_text}"
-    except Exception as e:
-        return f"Failed to click {button_text}: {str(e)}"
-
-
-async def run_test_scenario(page, scenario: dict) -> dict:
-    """
-    Run a single test scenario by clicking through the steps
-    and verifying the expected result.
-    Returns a result dict with pass/fail status.
-    """
-    print(f"\n  Running: {scenario['name']}")
-    print(f"  Steps: {' → '.join(scenario['steps'])}")
-
-    # Clear the calculator before each test
-    try:
-        await page.locator('button:has-text("C")').first.click()
-        await page.wait_for_timeout(300)
-    except:
-        pass
-
-    # Execute each step
-    for step in scenario['steps']:
-        result = await click_button(page, step)
-        print(f"    {result}")
-        await page.wait_for_timeout(200)
-
-    # Read the final display state
-    state = await get_page_state(page)
-    actual_result = state["display"]
-
-    # Compare with expected
-    passed = str(actual_result).strip() == str(scenario["expected_result"]).strip()
-
-    result = {
-        "scenario": scenario["name"],
-        "description": scenario["description"],
-        "steps": scenario["steps"],
-        "expected": scenario["expected_result"],
-        "actual": actual_result,
-        "passed": passed,
-        "screenshot": state["screenshot"]
-    }
-
-    status = "✓ PASS" if passed else "✗ FAIL"
-    print(f"  {status} — Expected: '{scenario['expected_result']}' | Got: '{actual_result}'")
-
-    return result
-
-
-async def run_playwright_tests(base_url: str = "http://localhost:3000") -> list:
-    """
-    Main Playwright test runner.
-    Opens browser, runs all scenarios, returns results.
-    """
-    print("\nLaunching Chromium browser...")
-
-    async with async_playwright() as p:
-        # Launch browser
-        # headless=False means you can SEE the browser opening and clicking
-        # Set to True to run invisibly in background
-        browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
-
-        # ── BROWSER CONSOLE LISTENER ──
-        # This captures JavaScript errors that happen inside React
-        # These are invisible to the terminal but visible here
-        # Stored so we can include them in the failure report
-        browser_errors = []
-        page.on("console", lambda msg: browser_errors.append(
-            f"[{msg.type.upper()}] {msg.text}"
-        ) if msg.type in ["error", "warning"] else None)
-
-        page.on("pageerror", lambda err: browser_errors.append(
-            f"[JS CRASH] {err}"
-        ))
-
-
-        print(f"Navigating to {base_url}...")
-        await page.goto(base_url)
-
-        # Wait for the page to fully load
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(1000)
-
-        # Capture initial page state
-        print("\nReading initial page state...")
-        initial_state = await get_page_state(page)
-        print(f"  Buttons found: {initial_state['buttons_available']}")
-        print(f"  Display: '{initial_state['display']}'")
-
-        if not initial_state['buttons_available']:
-            print("  ✗ No buttons found — page may not have loaded correctly")
-            await browser.close()
-            return []
-
-        # Run all test scenarios
-        print(f"\nRunning {len(TEST_SCENARIOS)} test scenarios...")
-        results = []
-
-        for scenario in TEST_SCENARIOS:
-            result = await run_test_scenario(page, scenario)
-            results.append(result)
-
-
-        # Print any browser errors collected during the session
-        if browser_errors:
-            print("\n  Browser console errors detected:")
-            for err in browser_errors:
-                print(f"    {err}")
-
-        await browser.close()
-
-        # Attach browser errors to each result so the LLM
-        # can reason about them during analysis
-        for result in results:
-            result["browser_errors"] = browser_errors
-
-        return results
-
-
-def analyze_results_with_llm(results: list, architecture: str) -> dict:
-    """
-    Use the LLM to analyze test results and generate a report.
-    If tests failed, it produces a structured failure report
-    that the Coder agent can act on.
-
-    This is the REASONING step of the Tester's PARL loop —
-    making sense of what was observed.
-    """
-    results_json = json.dumps(results, indent=2)
-
-    # ── Collect browser errors BEFORE building messages list ──
-    # This must be outside the messages list — it's Python code
-    # not a message object
-    all_browser_errors = []
-    for r in results:
-        all_browser_errors.extend(r.get("browser_errors", []))
-
-    browser_error_text = '\n'.join(all_browser_errors) if all_browser_errors else "None"
-
-    # Now build the messages list using the collected data
-    messages = [
-        SystemMessage(content="""You are a QA engineer analyzing test results.
-Analyze the test results and return a JSON report in this exact format:
+# ── RESULT ANALYSIS PROMPT ──
+# Asks the LLM to reason about what failed and why
+# Produces structured failure reports the Coder can act on
+RESULT_ANALYSIS_PROMPT = """You are a QA engineer analyzing Playwright test results.
+Analyze the results and return a JSON report in this exact format:
 {
   "overall_status": "PASS" or "FAIL",
   "passed_count": number,
@@ -270,7 +79,231 @@ Analyze the test results and return a JSON report in this exact format:
   ],
   "recommendation": "what the Coder agent should do next"
 }
-Return ONLY the JSON object, no explanation."""),
+Return ONLY the JSON object, no explanation.
+"""
+
+
+# ──────────────────────────────────────────
+# SCENARIO GENERATION
+# ──────────────────────────────────────────
+
+def generate_test_scenarios(architecture: str) -> list:
+    """
+    Dynamically generates Playwright test scenarios
+    from the architecture spec.
+    Works for any app — not hardcoded to any specific project.
+    This is the PERCEIVE step — understanding what needs testing.
+    """
+    print("\n  Generating test scenarios from architecture...")
+
+    messages = [
+        SystemMessage(content=SCENARIO_GENERATION_PROMPT),
+        HumanMessage(content=f"""Generate test scenarios for this app:
+
+{architecture}
+
+The app runs on http://localhost:3000
+""")
+    ]
+
+    response = llm.invoke(
+        messages,
+        config={
+            "run_name": "Tester — Generate Scenarios",
+            "tags": ["tester", "parl", "planning"],
+            "metadata": {
+                "agent": "tester",
+                "step": "scenario_planning",
+                "model": "llama-3.3-70b-versatile"
+            }
+        }
+    )
+
+    raw = response.content.strip()
+
+    # Strip markdown fences if present
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    # Extract just the JSON array
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start != -1 and end != 0:
+        raw = raw[start:end]
+
+    try:
+        scenarios = json.loads(raw)
+        print(f"  → Generated {len(scenarios)} scenarios:")
+        for s in scenarios:
+            print(f"    - {s['name']}")
+        return scenarios
+    except json.JSONDecodeError as e:
+        print(f"  ✗ Could not parse scenarios: {e}")
+        return []
+
+
+# ──────────────────────────────────────────
+# PLAYWRIGHT BROWSER ACTIONS
+# ──────────────────────────────────────────
+
+async def execute_scenario(page, scenario: dict) -> dict:
+    """
+    Executes a single test scenario by running each action
+    in sequence. Stops on first failure.
+    This is the ACT step — physically interacting with the UI.
+
+    Supported action types:
+    navigate, click, fill, assert_text, assert_visible, wait
+    """
+    print(f"\n  Running: {scenario['name']}")
+
+    passed = True
+    error_message = ""
+    actions_completed = 0
+
+    for action in scenario.get("actions", []):
+        action_type = action.get("type")
+
+        try:
+            if action_type == "navigate":
+                await page.goto(action["url"])
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(500)
+
+            elif action_type == "click":
+                await page.locator(action["selector"]).first.click()
+                await page.wait_for_timeout(300)
+
+            elif action_type == "fill":
+                await page.locator(action["selector"]).first.fill(action["value"])
+                await page.wait_for_timeout(200)
+
+            elif action_type == "assert_text":
+                element = page.locator(action["selector"]).first
+                actual = await element.inner_text()
+                if action["expected"] not in actual:
+                    passed = False
+                    error_message = (
+                        f"Expected '{action['expected']}' "
+                        f"in '{actual[:50]}'"
+                    )
+
+            elif action_type == "assert_visible":
+                visible = await page.locator(action["selector"]).first.is_visible()
+                if not visible:
+                    passed = False
+                    error_message = f"Element '{action['selector']}' not visible"
+
+            elif action_type == "wait":
+                await page.wait_for_timeout(int(action.get("value", 500)))
+
+            actions_completed += 1
+
+        except Exception as e:
+            passed = False
+            error_message = f"Action '{action_type}' failed: {str(e)[:100]}"
+            print(f"    ✗ {error_message}")
+            break
+
+    status = "✓ PASS" if passed else "✗ FAIL"
+    print(f"  {status} — {scenario['name']}")
+    if not passed:
+        print(f"    Reason: {error_message}")
+
+    # Screenshot after each scenario for the trace log
+    screenshot_path = f"logs/screenshot_{scenario['name'].replace(' ', '_')}.png"
+    os.makedirs("logs", exist_ok=True)
+    await page.screenshot(path=screenshot_path)
+
+    return {
+        "scenario": scenario["name"],
+        "description": scenario.get("description", ""),
+        "passed": passed,
+        "error": error_message,
+        "actions_completed": actions_completed,
+        "total_actions": len(scenario.get("actions", [])),
+        "screenshot": screenshot_path
+    }
+
+
+async def run_playwright_tests(
+    base_url: str = "http://localhost:3000",
+    scenarios: list = None
+) -> list:
+    """
+    Opens a real Chromium browser and runs all test scenarios.
+    Captures browser console errors and page crashes automatically.
+    Returns list of result dicts — one per scenario.
+    """
+    print("\n  Launching Chromium browser...")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        page = await browser.new_page()
+
+        # ── BROWSER ERROR LISTENERS ──
+        # Captures JS errors that happen inside React
+        # These are invisible to the terminal but visible here
+        browser_errors = []
+
+        page.on("console", lambda msg: browser_errors.append(
+            f"[{msg.type.upper()}] {msg.text}"
+        ) if msg.type in ["error", "warning"] else None)
+
+        page.on("pageerror", lambda err: browser_errors.append(
+            f"[JS CRASH] {err}"
+        ))
+
+        print(f"  Navigating to {base_url}...")
+        await page.goto(base_url)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(1000)
+
+        print(f"\n  Running {len(scenarios)} scenarios...")
+        results = []
+
+        for scenario in scenarios:
+            result = await execute_scenario(page, scenario)
+            results.append(result)
+
+        # Print browser errors collected during the full session
+        if browser_errors:
+            print("\n  Browser console errors detected:")
+            for err in browser_errors:
+                print(f"    {err}")
+
+        # Attach browser errors to every result
+        # so the LLM can reason about them during analysis
+        for result in results:
+            result["browser_errors"] = browser_errors
+
+        await browser.close()
+        return results
+
+
+# ──────────────────────────────────────────
+# RESULT ANALYSIS
+# ──────────────────────────────────────────
+
+def analyze_results_with_llm(results: list, architecture: str) -> dict:
+    """
+    Uses the LLM to analyze Playwright results and produce
+    a structured failure report the Coder agent can act on.
+    This is the REASON step — making sense of what was observed.
+    """
+    results_json = json.dumps(results, indent=2)
+
+    # Collect all browser errors across all scenarios
+    all_browser_errors = []
+    for r in results:
+        all_browser_errors.extend(r.get("browser_errors", []))
+    browser_error_text = '\n'.join(all_browser_errors) or "None"
+
+    messages = [
+        SystemMessage(content=RESULT_ANALYSIS_PROMPT),
         HumanMessage(content=f"""Analyze these test results:
 
 {results_json}
@@ -299,7 +332,7 @@ Architecture context:
 
     raw = response.content.strip()
 
-    # Strip markdown fences
+    # Strip markdown fences if present
     if raw.startswith("```"):
         lines = raw.split("\n")
         lines = lines[1:]
@@ -309,42 +342,73 @@ Architecture context:
 
     try:
         return json.loads(raw)
-    except:
+    except json.JSONDecodeError:
         return {
             "overall_status": "UNKNOWN",
+            "passed_count": 0,
+            "failed_count": len(results),
             "summary": raw,
             "failures": [],
-            "recommendation": "Manual review needed"
+            "recommendation": "Manual review needed — could not parse LLM analysis"
         }
 
 
+# ──────────────────────────────────────────
+# MAIN ENTRY POINT
+# ──────────────────────────────────────────
+
 def run_tester(architecture: str = "") -> dict:
     """
-    Main entry point for the Tester agent.
-    Runs Playwright tests and returns analysis report.
+    Runs the full Tester agent PARL loop:
+    Perceive → generate test scenarios from architecture
+    Act      → run Playwright browser tests
+    Reason   → analyze results with LLM
+    Learn    → save report for negotiation loop
     """
     print("\n" + "="*50)
     print("TESTER AGENT STARTING")
     print("="*50)
 
-    # ── PERCEIVE + ACT ──
+    # ── PERCEIVE ──
+    # Understand what needs to be tested
+    scenarios = generate_test_scenarios(architecture)
+
+    if not scenarios:
+        return {
+            "overall_status": "FAIL",
+            "passed_count": 0,
+            "failed_count": 0,
+            "summary": "Could not generate test scenarios",
+            "failures": [],
+            "recommendation": "Check that architecture.md exists and is valid"
+        }
+
+    # ── ACT ──
     # Run the actual browser tests
-    results = asyncio.run(run_playwright_tests())
+    results = asyncio.run(
+        run_playwright_tests(
+            base_url="http://localhost:3000",
+            scenarios=scenarios
+        )
+    )
 
     if not results:
         return {
             "overall_status": "FAIL",
+            "passed_count": 0,
+            "failed_count": 0,
             "summary": "Could not run tests — page did not load",
             "failures": [],
-            "recommendation": "Check that React app is running on localhost:3000"
+            "recommendation": "Check React app is running on localhost:3000"
         }
 
     # ── REASON ──
-    # Analyze what happened
-    print("\nAnalyzing results with LLM...")
+    # Analyze what happened and produce structured report
+    print("\n  Analyzing results with LLM...")
     report = analyze_results_with_llm(results, architecture)
 
-    # ── REPORT ──
+    # ── LEARN ──
+    # Save report so pipeline and negotiation loop can read it
     print("\n" + "="*50)
     print("TESTER AGENT REPORT")
     print("="*50)
@@ -360,9 +424,6 @@ def run_tester(architecture: str = "") -> dict:
             print(f"    Cause : {f.get('likely_cause')}")
             print(f"    Fix   : {f.get('fix_needed')}")
 
-    print(f"\nRecommendation: {report.get('recommendation')}")
-
-    # Save report to disk for the negotiation loop
     os.makedirs("logs", exist_ok=True)
     report_path = "logs/test_report.json"
     with open(report_path, 'w') as f:
@@ -371,11 +432,11 @@ def run_tester(architecture: str = "") -> dict:
             "analysis": report
         }, f, indent=2)
 
-    print(f"\nFull report saved to: {report_path}")
-
+    print(f"\n  Report saved to: {report_path}")
     return report
 
 
+# ── RUN DIRECTLY TO TEST ──
 if __name__ == "__main__":
     arch_path = "project/architecture.md"
     architecture = ""
@@ -383,5 +444,8 @@ if __name__ == "__main__":
     if os.path.exists(arch_path):
         with open(arch_path, 'r') as f:
             architecture = f.read()
+        print(f"✓ Read architecture.md ({len(architecture)} chars)")
+    else:
+        print("⚠ No architecture.md found — running with empty architecture")
 
     run_tester(architecture)

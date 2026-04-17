@@ -1,10 +1,8 @@
 import os
-import sys
 import json
 import asyncio
 import threading
 from datetime import datetime
-from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -12,11 +10,21 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+import logging
+
+# ──────────────────────────────────────────
+# APP SETUP
+# ──────────────────────────────────────────
 
 app = FastAPI(title="PARL Agent Pipeline API")
 
-# ── CORS ──
-# Allows the React dashboard (localhost:3001) to call this API
+# Suppress uvicorn access logs (the INFO lines like "GET /status 200")
+# Only WARNING and ERROR level logs will show
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("fastapi").setLevel(logging.WARNING)
+
+# Allow the React dashboard on any port to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,69 +32,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── CONNECTION MANAGER ──
-# Manages all active WebSocket connections
-# Multiple browser tabs can connect simultaneously
+# ──────────────────────────────────────────
+# WEBSOCKET CONNECTION MANAGER
+# ──────────────────────────────────────────
+
 class ConnectionManager:
+    """
+    Manages all active WebSocket connections.
+    Multiple browser tabs can connect simultaneously —
+    all receive the same broadcast messages.
+    """
+
     def __init__(self):
         self.active_connections: list[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        print(f"  WebSocket connected. Total: {len(self.active_connections)}")
+        print(f"  WebSocket connected. Active: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        print(f"  WebSocket disconnected. Total: {len(self.active_connections)}")
+        print(f"  WebSocket disconnected. Active: {len(self.active_connections)}")
 
     async def broadcast(self, message: dict):
-        """Send a message to ALL connected clients."""
+        """
+        Sends a message to all connected clients.
+        Automatically removes dead connections.
+        """
         disconnected = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except:
+            except Exception:
                 disconnected.append(connection)
 
-        # Clean up dead connections
         for conn in disconnected:
             self.active_connections.remove(conn)
 
 
 manager = ConnectionManager()
 
-# ── PIPELINE STATE ──
-# Tracks the current pipeline run status
-# This is read by the /status endpoint
+# ──────────────────────────────────────────
+# PIPELINE STATE
+# ──────────────────────────────────────────
+
+# Tracks the current pipeline run.
+# Read by the /status endpoint and updated by emit_event.
 pipeline_status = {
-    "running": False,
+    "running":       False,
     "current_agent": None,
-    "iteration": 0,
-    "status": "idle",
-    "last_updated": None,
-    "result": None
+    "iteration":     0,
+    "status":        "idle",
+    "last_updated":  None,
+    "result":        None
 }
 
+# ──────────────────────────────────────────
+# EVENT EMITTER
+# ──────────────────────────────────────────
 
-# ── EVENT EMITTER ──
-# This function is passed into the pipeline so agents can
-# broadcast their progress to the frontend in real time
-# It runs in a background thread so we need asyncio bridge
 def emit_event(event_type: str, data: dict):
     """
-    Called by agents to broadcast progress to all WebSocket clients.
-    event_type examples: "agent_start", "agent_complete", "file_created",
-                         "test_result", "pipeline_complete", "error"
+    Broadcasts a pipeline event to all WebSocket clients.
+    Called by agent nodes in pipeline.py during execution.
+
+    Runs in a background thread, so uses asyncio bridge
+    to safely communicate with the async WebSocket layer.
+
+    Event types:
+    - pipeline_start    : pipeline has begun
+    - agent_start       : an agent node started
+    - agent_complete    : an agent node finished
+    - pipeline_complete : entire pipeline finished
+    - pipeline_error    : pipeline crashed
     """
     message = {
-        "type": event_type,
-        "data": data,
+        "type":      event_type,
+        "data":      data,
         "timestamp": datetime.now().isoformat()
     }
 
-    # Update pipeline status
+    # ── UPDATE PIPELINE STATUS ──
     pipeline_status["last_updated"] = message["timestamp"]
 
     if event_type == "agent_start":
@@ -104,8 +132,8 @@ def emit_event(event_type: str, data: dict):
         pipeline_status["status"] = "error"
         pipeline_status["current_agent"] = None
 
-    # Broadcast to all WebSocket clients
-    # Since this runs in a thread, we use asyncio to bridge to async
+    # ── BROADCAST TO WEBSOCKET CLIENTS ──
+    # Bridge from sync thread to async event loop
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -115,80 +143,92 @@ def emit_event(event_type: str, data: dict):
     except Exception as e:
         print(f"  WebSocket broadcast error: {e}")
 
-    # Always print to terminal too
-    print(f"  [{event_type}] {json.dumps(data)[:100]}")
+    # Always print to terminal for debugging
+    print(f"  [{event_type}] {json.dumps(data)[:120]}")
 
 
-# ── PIPELINE RUNNER ──
-# Runs the pipeline in a background thread so FastAPI
-# stays responsive while agents are working
+# ──────────────────────────────────────────
+# PIPELINE THREAD
+# ──────────────────────────────────────────
+
 def run_pipeline_thread(requirements: str):
-    """Runs the full pipeline in a background thread."""
+    """
+    Runs the full multi-agent pipeline in a background thread.
+    FastAPI stays responsive while agents are working.
+    Emits WebSocket events throughout so the dashboard
+    receives live updates.
+    """
     try:
-        # Import pipeline
         from pipeline import run_pipeline as execute_pipeline
 
         pipeline_status["running"] = True
         pipeline_status["status"] = "running"
         pipeline_status["iteration"] = 0
 
-        emit_event("pipeline_start", {
-            "message": "Pipeline starting",
-            "requirements": requirements[:100]
-        })
-
-        # Run the pipeline
+        # Run the pipeline — pass emit_event so agents can
+        # broadcast their progress to the dashboard
         final_state = execute_pipeline(
             requirements=requirements,
-            emit_event=emit_event  # pass emitter to pipeline
+            emit_event=emit_event
         )
 
-        # Emit completion
+        # Broadcast completion summary
+        test_report = final_state.get("test_report", {})
         emit_event("pipeline_complete", {
-            "status": final_state.get("status"),
-            "iterations": final_state.get("iteration"),
+            "status":        final_state.get("status"),
+            "iterations":    final_state.get("iteration"),
             "files_created": len(final_state.get("created_files", [])),
-            "test_status": final_state.get("test_report", {}).get("overall_status"),
-            "summary": final_state.get("test_report", {}).get("summary", "")
+            "test_status":   test_report.get("overall_status"),
+            "summary":       test_report.get("summary", "")
         })
 
     except Exception as e:
         emit_event("pipeline_error", {
-            "error": str(e),
+            "error":   str(e),
             "message": "Pipeline failed with an error"
         })
         pipeline_status["running"] = False
         pipeline_status["status"] = "error"
 
 
-# ── REST ENDPOINTS ──
+# ──────────────────────────────────────────
+# REST ENDPOINTS
+# ──────────────────────────────────────────
 
 @app.get("/")
 async def root():
+    """Health check — confirms the API is running."""
     return {"message": "PARL Agent Pipeline API", "status": "running"}
 
 
 @app.post("/run-pipeline")
 async def run_pipeline_endpoint(body: dict):
     """
-    Triggers the multi-agent pipeline.
-    Accepts: { "requirements": "Build a calculator..." }
-    Returns immediately — progress comes via WebSocket.
+    Triggers the multi-agent pipeline with the given requirements.
+
+    Accepts:
+        { "requirements": "Build a todo app using MERN stack..." }
+
+    Returns immediately — live progress is streamed via WebSocket.
+    Connect to ws://localhost:8000/ws to receive events.
+
+    Returns 409 if a pipeline is already running.
+    Returns 400 if requirements field is missing or empty.
     """
     if pipeline_status["running"]:
         return JSONResponse(
             status_code=409,
-            content={"error": "Pipeline already running"}
+            content={"error": "Pipeline already running. Wait for it to finish."}
         )
 
     requirements = body.get("requirements", "").strip()
     if not requirements:
         return JSONResponse(
             status_code=400,
-            content={"error": "requirements field is required"}
+            content={"error": "requirements field is required and cannot be empty"}
         )
 
-    # Start pipeline in background thread
+    # Start pipeline in background — don't block the HTTP response
     thread = threading.Thread(
         target=run_pipeline_thread,
         args=(requirements,),
@@ -197,55 +237,73 @@ async def run_pipeline_endpoint(body: dict):
     thread.start()
 
     return {
-        "message": "Pipeline started",
-        "status": "running",
-        "connect_websocket": "ws://localhost:8000/ws"
+        "message":           "Pipeline started successfully",
+        "status":            "running",
+        "websocket":         "ws://localhost:8000/ws",
+        "requirements_preview": requirements[:100]
     }
 
 
 @app.get("/status")
 async def get_status():
-    """Returns current pipeline status."""
+    """
+    Returns the current pipeline status.
+    Useful for polling if WebSocket is not available.
+    """
     return pipeline_status
 
 
 @app.get("/files")
 async def get_files():
-    """Returns list of all generated files in project/."""
+    """
+    Returns all files generated in the project/ folder
+    with their content and size.
+    Skips node_modules and binary files.
+    Works for any generated app — not hardcoded to any project.
+    """
     project_root = "project"
     files = []
 
     if not os.path.exists(project_root):
-        return {"files": []}
+        return {"files": [], "total": 0}
 
     for root, dirs, filenames in os.walk(project_root):
+        # Skip node_modules — too large and not useful to display
         dirs[:] = [d for d in dirs if d != "node_modules"]
+
         for filename in filenames:
             filepath = os.path.join(root, filename)
             rel_path = os.path.relpath(filepath, project_root)
+
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
                 files.append({
-                    "path": rel_path.replace("\\", "/"),
+                    "path":    rel_path.replace("\\", "/"),
                     "content": content,
-                    "size": len(content)
+                    "size":    len(content)
                 })
-            except:
+            except Exception:
+                # Skip binary files or files with encoding issues
                 pass
 
-    return {"files": files}
+    return {"files": files, "total": len(files)}
 
 
 @app.get("/logs")
 async def get_logs():
-    """Returns server and client logs."""
+    """
+    Returns the last 3000 characters of server and client logs.
+    Used by the dashboard to show runtime errors.
+    """
     logs = {}
     for log_name in ["server.log", "client.log"]:
         log_path = os.path.join("logs", log_name)
         if os.path.exists(log_path):
             with open(log_path, 'r') as f:
-                logs[log_name] = f.read()[-3000:]  # last 3000 chars
+                content = f.read()
+            # Return only last 3000 chars — logs can get large
+            logs[log_name] = content[-3000:] if len(content) > 3000 else content
         else:
             logs[log_name] = ""
     return logs
@@ -253,35 +311,64 @@ async def get_logs():
 
 @app.get("/test-report")
 async def get_test_report():
-    """Returns the latest test report."""
+    """
+    Returns the latest Playwright test report.
+    Includes raw results per scenario and LLM analysis.
+    """
     report_path = "logs/test_report.json"
+
     if not os.path.exists(report_path):
-        return {"error": "No test report found yet"}
+        return {"error": "No test report found. Run the pipeline first."}
+
     with open(report_path, 'r') as f:
         return json.load(f)
 
 
-# ── WEBSOCKET ENDPOINT ──
+@app.get("/architecture")
+async def get_architecture():
+    """
+    Returns the architecture.md generated by the Architect agent.
+    Useful for the dashboard to show what was designed.
+    """
+    arch_path = "project/architecture.md"
+
+    if not os.path.exists(arch_path):
+        return {"error": "No architecture found. Run the pipeline first."}
+
+    with open(arch_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    return {"content": content, "length": len(content)}
+
+
+# ──────────────────────────────────────────
+# WEBSOCKET ENDPOINT
+# ──────────────────────────────────────────
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket connection for real-time pipeline updates.
-    The React dashboard connects here to receive live events.
+    WebSocket endpoint for real-time pipeline updates.
+    The React dashboard connects here on load and receives
+    all agent events as they happen.
+
+    Client can send "ping" messages to keep the connection alive.
+    Server responds with "pong".
     """
     await manager.connect(websocket)
 
     # Send current status immediately on connect
+    # so the dashboard reflects the right state even if
+    # the pipeline was already running before the page loaded
     await websocket.send_json({
-        "type": "connection_established",
-        "data": pipeline_status,
+        "type":      "connection_established",
+        "data":      pipeline_status,
         "timestamp": datetime.now().isoformat()
     })
 
     try:
-        # Keep connection alive — wait for messages from client
         while True:
             data = await websocket.receive_text()
-            # Client can send "ping" to keep connection alive
             if data == "ping":
                 await websocket.send_json({"type": "pong"})
 
@@ -289,8 +376,22 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+# ──────────────────────────────────────────
+# ENTRY POINT
+# ──────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("Starting PARL Agent Pipeline API...")
-    print("API docs: http://localhost:8000/docs")
-    print("WebSocket: ws://localhost:8000/ws")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+    print("\n" + "="*50)
+    print("  PARL Agent Pipeline API")
+    print("="*50)
+    print(f"  API docs  : http://localhost:8000/docs")
+    print(f"  WebSocket : ws://localhost:8000/ws")
+    print(f"  Status    : http://localhost:8000/status")
+    print("="*50 + "\n")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        log_level="warning"  # ← only warnings and errors
+    )
