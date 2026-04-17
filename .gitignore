@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node
+node_modules/
+npm-debug.log
+
+# Generated at runtime — ignored but folder kept
+project/*
+!project/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+package-lock.json
+yarn.lock
