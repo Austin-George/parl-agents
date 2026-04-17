@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
@@ -57,7 +58,7 @@ Rules:
 
 # ── FILE GENERATION PROMPT ──
 # Strict rules to prevent the most common model mistakes:
-# wrong import paths, placeholder comments, missing code
+# wrong import paths, placeholder comments, missing exports
 FILE_GENERATION_PROMPT = """You are an expert MERN stack developer.
 Generate COMPLETE, PRODUCTION-READY file content.
 
@@ -77,10 +78,57 @@ STRICT RULES — violating any of these is unacceptable:
    - // TODO, // add your code, // replace with  ✗ never
 7. For server/app.js ALWAYS include this health check route:
    app.get('/', (req, res) => res.json({ status: 'ok' }))
-8. Return ONLY the raw file content
-9. No markdown fences, no explanation before or after
+8. ALWAYS end model files with: export default ModelName
+9. ALWAYS end route files with: export default router
+10. Return ONLY the raw file content
+11. No markdown fences, no explanation before or after
 """
 
+
+# ──────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────
+
+def strip_fences(content: str) -> str:
+    """
+    Strips markdown code fences from LLM output.
+    Models add these despite instructions — handle defensively.
+    """
+    if content.startswith("```"):
+        lines = content.split("\n")
+        lines = lines[1:]  # remove opening fence line
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]  # remove closing fence line
+        content = "\n".join(lines).strip()
+    return content
+
+
+def run_fix_pass(filepath: str, description: str,
+                 content: str, issue: str) -> str:
+    """
+    Runs a single fix pass on a file with a specific issue description.
+    Returns the fixed content with fences stripped.
+    Shared by all three validation passes.
+    """
+    fix_response = llm.invoke([
+        SystemMessage(content=FILE_GENERATION_PROMPT),
+        HumanMessage(content=f"""Fix the following issue in this file.
+
+File: {filepath}
+Issue: {issue}
+
+Current content:
+{content}
+
+Return the complete fixed file.
+""")
+    ])
+    return strip_fences(fix_response.content.strip())
+
+
+# ──────────────────────────────────────────
+# FILE PLAN GENERATION
+# ──────────────────────────────────────────
 
 def generate_file_plan(architecture: str) -> list:
     """
@@ -135,18 +183,43 @@ def generate_file_plan(architecture: str) -> list:
         return []
 
 
-def generate_file_content(filepath: str, description: str) -> str:
+# ──────────────────────────────────────────
+# FILE CONTENT GENERATION
+# ──────────────────────────────────────────
+
+def generate_file_content(filepath: str, description: str,
+                           file_plan: list = None) -> str:
     """
     Generates complete content for a single file.
-    Runs a verification pass if placeholder comments are detected.
+    Runs four validation passes after generation:
+      Pass 1 — Strip markdown fences
+      Pass 2 — Fix placeholder comments
+      Pass 3 — Ensure export default in models and routes
+      Pass 4 — Verify import paths match actual files in plan
     This is the ACT step — producing the actual code.
     """
+
+    # Build context about other files so import paths are correct
+    # This is the key fix for "Module not found" errors — the model
+    # knows exactly what files exist and where they are
+    other_files_context = ""
+    if file_plan:
+        other_paths = [
+            f["path"] for f in file_plan
+            if f["path"] != filepath
+        ]
+        other_files_context = f"""
+Other files in this project (use these exact paths for imports):
+{chr(10).join(other_paths)}
+"""
+
     messages = [
         SystemMessage(content=FILE_GENERATION_PROMPT),
         HumanMessage(content=f"""Generate the COMPLETE content for this file.
 
 File path: {filepath}
 What this file does: {description}
+{other_files_context}
 """)
     ]
 
@@ -163,21 +236,11 @@ What this file does: {description}
         }
     )
 
-    content = response.content.strip()
+    # Pass 1 — Strip markdown fences
+    content = strip_fences(response.content.strip())
 
-    # ── STRIP MARKDOWN FENCES ──
-    # Models occasionally wrap output in ```javascript ... ```
-    # despite instructions — strip defensively
-    if content.startswith("```"):
-        lines = content.split("\n")
-        lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        content = "\n".join(lines).strip()
-
-    # ── VERIFICATION PASS ──
-    # If placeholder comments are detected run a fix pass
-    # This catches cases where the model ignored instructions
+    # ── PASS 2: PLACEHOLDER CHECK ──
+    # Catches cases where the model ignored the no-placeholder rule
     placeholder_signals = [
         "// add your",
         "// replace with",
@@ -192,36 +255,72 @@ What this file does: {description}
     found = [p for p in placeholder_signals if p.lower() in content.lower()]
 
     if found:
-        print(f"  ⚠ Placeholder detected ({found[0]}), running fix pass...")
+        print(f"  ⚠ Placeholder detected ({found[0]}), fixing...")
+        content = run_fix_pass(
+            filepath, description, content,
+            f"Remove all placeholder comments like '{found[0]}' "
+            f"and replace with real working code"
+        )
 
-        fix_messages = [
-            SystemMessage(content=FILE_GENERATION_PROMPT),
-            HumanMessage(content=f"""This file has placeholder comments.
-Replace ALL placeholders with real working code.
+    # ── PASS 3: EXPORT DEFAULT CHECK ──
+    # Models frequently forget export default on models and routes
+    # causing Node.js crash: "does not provide an export named default"
+    is_model = 'models/' in filepath
+    is_route = 'routes/' in filepath
 
-File: {filepath}
-Description: {description}
+    if (is_model or is_route) and 'export default' not in content:
+        print(f"  ⚠ Missing export default in {filepath}, fixing...")
+        content = run_fix_pass(
+            filepath, description, content,
+            "Add 'export default' for the main export at the bottom of the file. "
+            "For models: 'export default ModelName'. "
+            "For routes: 'export default router'."
+        )
 
-Current content:
-{content}
+    # ── PASS 4: IMPORT PATH CHECK ──
+    # Catches wrong relative import paths in App.js and index.js
+    # e.g. importing './Calculator' when file is at './components/Calculator'
+    if file_plan and ('App.js' in filepath or 'index.js' in filepath):
+        relative_imports = re.findall(
+            r"from ['\"](\./[^'\"]+)['\"]", content
+        )
 
-Return the complete fixed file with no placeholders.
-""")
-        ]
+        if relative_imports:
+            # Build a set of valid relative paths from the file plan
+            # so we can check if imports actually point to real files
+            valid_paths = set()
+            for f in file_plan:
+                # Convert plan path to relative import format
+                # e.g. "client/src/components/Calculator.js"
+                # becomes "./components/Calculator"
+                plan_path = f["path"]
+                if plan_path.startswith("client/src/"):
+                    rel = plan_path.replace("client/src/", "./")
+                    rel = rel.replace(".js", "")
+                    valid_paths.add(rel)
 
-        fix_response = llm.invoke(fix_messages)
-        content = fix_response.content.strip()
+            # Check if any imports look wrong
+            wrong_imports = [
+                imp for imp in relative_imports
+                if imp not in valid_paths
+                and not any(imp in vp or vp in imp for vp in valid_paths)
+            ]
 
-        # Strip fences again after fix pass
-        if content.startswith("```"):
-            lines = content.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            content = "\n".join(lines).strip()
+            if wrong_imports:
+                print(f"  ⚠ Possibly wrong imports {wrong_imports}, fixing...")
+                valid_list = "\n".join(sorted(valid_paths))
+                content = run_fix_pass(
+                    filepath, description, content,
+                    f"Fix these import paths that may be incorrect: {wrong_imports}. "
+                    f"Valid import paths in this project are:\n{valid_list}"
+                )
 
     return content
 
+
+# ──────────────────────────────────────────
+# FILE SAVING
+# ──────────────────────────────────────────
 
 def save_file(relative_path: str, content: str) -> str:
     """
@@ -237,6 +336,10 @@ def save_file(relative_path: str, content: str) -> str:
 
     return full_path
 
+
+# ──────────────────────────────────────────
+# MAIN ENTRY POINT
+# ──────────────────────────────────────────
 
 def run_coder(architecture: str) -> list:
     """
@@ -276,7 +379,11 @@ def run_coder(architecture: str) -> list:
         print(f"\n[{i}/{total}] {relative_path}")
 
         try:
-            content = generate_file_content(relative_path, description)
+            content = generate_file_content(
+                relative_path,
+                description,
+                file_plan=file_plan  # pass full plan for import validation
+            )
 
             if not content:
                 print(f"  ✗ Empty response")

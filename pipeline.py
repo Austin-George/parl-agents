@@ -130,24 +130,33 @@ def tester_node(state: PipelineState) -> PipelineState:
         startup_result = server_manager.setup_and_start()
 
         if not startup_result["success"]:
-            # Server failed to start — treat as a test failure
-            # so the Coder gets a chance to fix the startup error
             startup_errors = startup_result["errors"]
-            print(f"\n  ✗ Servers failed to start: {startup_errors}")
+
+            # Read the full server log for detailed error
+            full_log = server_manager.read_server_errors()
+
+            print(f"\n  ✗ Servers failed to start")
+            print(f"  Error: {full_log[:300]}")
 
             report = {
                 "overall_status": "FAIL",
                 "passed_count": 0,
                 "failed_count": 1,
-                "summary": "Application failed to start",
+                "summary": "Application failed to start due to a runtime error",
                 "failures": [{
                     "scenario": "Server Startup",
-                    "expected": "Server running on port 5000",
-                    "actual": str(startup_errors),
-                    "likely_cause": "Runtime error or missing dependency",
-                    "fix_needed": f"Fix startup errors: {startup_errors}"
+                    "expected": "Server starts successfully on port 5000",
+                    "actual": full_log or str(startup_errors),
+                    "likely_cause": "Syntax error or missing export in a generated file",
+                    "fix_needed": (
+                        f"Fix the following server startup error: {full_log or startup_errors}. "
+                        f"Check all model files have 'export default' at the bottom. "
+                        f"Check all route files use correct import paths."
+                    )
                 }],
-                "recommendation": f"Fix these startup errors: {startup_errors}"
+                "recommendation": (
+                    f"Fix server startup error: {full_log or startup_errors}"
+                )
             }
 
         else:
@@ -231,15 +240,7 @@ def should_continue(state: PipelineState) -> str:
 # ──────────────────────────────────────────
 # FILE REPAIR (NEGOTIATION)
 # ──────────────────────────────────────────
-
 def fix_files_from_report(test_report: dict, architecture: str) -> list:
-    """
-    Reads the Tester's failure report and repairs only the
-    specific files that caused failures.
-
-    This is the core of the negotiation loop:
-    Tester identifies what broke → Coder fixes those files only.
-    """
     from langchain_groq import ChatGroq
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -256,23 +257,57 @@ def fix_files_from_report(test_report: dict, architecture: str) -> list:
         print("  No specific failures to fix")
         return []
 
-    # ── IDENTIFY WHICH FILES NEED FIXING ──
+    # ── EXTRACT FILE PATH FROM NODE.JS ERROR ──
+    # Node.js errors often mention the exact file:
+    # "file:///path/to/project/server/models/Calculation.js"
+    # We extract this to tell the LLM exactly which file to fix
+    import re
+    error_text = ' '.join([
+        f.get('actual', '') + ' ' + f.get('fix_needed', '')
+        for f in failures
+    ])
+
+    # Find file paths mentioned in error messages
+    file_mentions = re.findall(
+        r'project[/\\](server|client)[/\\][\w/\\.-]+\.js',
+        error_text
+    )
+    file_mentions = list(set([
+        f.replace('\\', '/') for f in file_mentions
+    ]))
+
+    if file_mentions:
+        print(f"  Files mentioned in error: {file_mentions}")
+
+    # ── ASK LLM WHICH FILES TO FIX ──
     messages = [
         SystemMessage(content="""You are a MERN stack developer fixing bugs.
-Given test failures, return a JSON array of files that need to be fixed:
+Given test failures and error messages, return a JSON array of files to fix.
+
+Return ONLY a JSON array:
 [
   {
-    "path": "server/routes/taskRoutes.js",
-    "fix": "specific description of what to change in this file"
+    "path": "server/models/Calculation.js",
+    "fix": "specific description of what to change"
   }
 ]
-Return ONLY the JSON array, no explanation."""),
-        HumanMessage(content=f"""Test failures:
+
+Rules:
+- If the error mentions a specific file, always include it
+- If the error says 'does not provide an export named default',
+  the fix is to add 'export default ModelName' at the bottom
+- If the error says 'cannot find module', check the import path
+- Return ONLY the JSON array
+"""),
+        HumanMessage(content=f"""Failures:
 {json.dumps(failures, indent=2)}
+
+Files mentioned in errors:
+{file_mentions}
 
 Recommendation: {recommendation}
 
-Which files need fixing? Return the JSON array.""")
+Which files need fixing?""")
     ]
 
     response = llm.invoke(
@@ -280,7 +315,6 @@ Which files need fixing? Return the JSON array.""")
         config={
             "run_name": "Coder — Identify Files to Fix",
             "tags": ["coder", "parl", "negotiation"],
-            "metadata": {"agent": "coder", "step": "fix_planning"}
         }
     )
 
@@ -292,11 +326,25 @@ Which files need fixing? Return the JSON array.""")
             lines = lines[:-1]
         raw = "\n".join(lines).strip()
 
+    # Extract JSON array
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start != -1 and end != 0:
+        raw = raw[start:end]
+
     try:
         files_to_fix = json.loads(raw)
     except json.JSONDecodeError:
         print("  ✗ Could not parse fix list")
-        return []
+        # Fallback — if we found file mentions in the error,
+        # fix those directly even if LLM parsing failed
+        if file_mentions:
+            files_to_fix = [{
+                "path": f,
+                "fix": f"Fix the error mentioned in: {error_text[:200]}"
+            } for f in file_mentions]
+        else:
+            return []
 
     # ── REGENERATE EACH BROKEN FILE ──
     PROJECT_ROOT = "project"
@@ -306,6 +354,7 @@ Which files need fixing? Return the JSON array.""")
 Generate the COMPLETE corrected file.
 Rules:
 - Use ES module syntax (import/export)
+- ALWAYS include 'export default' for models and routers
 - 2 space indentation
 - No placeholders or TODOs
 - Return ONLY the raw file content, no markdown fences
@@ -318,7 +367,6 @@ Rules:
         print(f"\n  Fixing: {filepath}")
         print(f"  Fix   : {fix_description}")
 
-        # Read current broken content for context
         full_path = os.path.join(PROJECT_ROOT, filepath)
         current_content = ""
         if os.path.exists(full_path):
@@ -345,24 +393,18 @@ Return the complete fixed file.""")
             config={
                 "run_name": f"Coder — Fix {filepath}",
                 "tags": ["coder", "parl", "negotiation", "fix"],
-                "metadata": {
-                    "agent": "coder",
-                    "step": "file_fix",
-                    "file": filepath
-                }
+                "metadata": {"file": filepath}
             }
         )
 
         fixed_content = fix_response.content.strip()
 
-        # Strip fences
         if fixed_content.startswith("```"):
             lines = fixed_content.split("\n")[1:]
             if lines and lines[-1].strip().startswith("```"):
                 lines = lines[:-1]
             fixed_content = "\n".join(lines).strip()
 
-        # Save repaired file
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, 'w', encoding='utf-8') as f:
             f.write(fixed_content)
