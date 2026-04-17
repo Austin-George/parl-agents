@@ -8,19 +8,19 @@ const WS_URL = 'ws://localhost:8000/ws';
 // ── AGENT STATUS CARD ──
 function AgentCard({ name, icon, status }) {
   const statusColors = {
-    idle: '#666',
-    running: '#f0a500',
+    idle:     '#666',
+    running:  '#f0a500',
     complete: '#4ecca3',
-    waiting: '#666',
-    error: '#e94560'
+    waiting:  '#666',
+    error:    '#e94560'
   };
 
   const statusLabels = {
-    idle: 'Idle',
-    running: 'Running...',
+    idle:     'Idle',
+    running:  'Running...',
     complete: 'Complete',
-    waiting: 'Waiting',
-    error: 'Error'
+    waiting:  'Waiting',
+    error:    'Error'
   };
 
   return (
@@ -44,26 +44,46 @@ function AgentCard({ name, icon, status }) {
 // ── COMMUNICATION LOG ITEM ──
 function LogItem({ event }) {
   const icons = {
-    pipeline_start: '🚀',
-    agent_start: '▶️',
-    agent_complete: '✅',
-    file_created: '📄',
-    test_result: '🧪',
-    pipeline_complete: '🎉',
-    pipeline_error: '❌',
-    connection_established: '🔌'
+    pipeline_start:         '🚀',
+    agent_start:            '▶️',
+    agent_complete:         '✅',
+    file_created:           '📄',
+    test_result:            '🧪',
+    pipeline_complete:      '🎉',
+    pipeline_error:         '❌',
+    connection_established: '🔌',
+    pong:                   '🏓'
   };
 
   const colors = {
-    pipeline_start: '#4ecca3',
-    agent_start: '#f0a500',
-    agent_complete: '#4ecca3',
-    file_created: '#a8dadc',
-    test_result: event.data?.passed ? '#4ecca3' : '#e94560',
-    pipeline_complete: '#4ecca3',
-    pipeline_error: '#e94560',
-    connection_established: '#666'
+    pipeline_start:         '#4ecca3',
+    agent_start:            '#f0a500',
+    agent_complete:         '#4ecca3',
+    file_created:           '#a8dadc',
+    pipeline_complete:      '#4ecca3',
+    pipeline_error:         '#e94560',
+    connection_established: '#666',
+    pong:                   '#333'
   };
+
+  // Safely extract a display message — never crash on undefined
+  function getDisplayMessage() {
+    if (!event || !event.data) return 'No data';
+    const d = event.data;
+    if (d.message) return d.message;
+    if (d.agent)   return d.agent;
+    try {
+      const str = JSON.stringify(d);
+      return str.length > 80 ? str.slice(0, 80) + '...' : str;
+    } catch {
+      return 'Event received';
+    }
+  }
+
+  // Don't render pong or connection noise in the log
+  if (event.type === 'pong' || event.type === 'connection_established') {
+    return null;
+  }
 
   return (
     <div className="log-item" style={{
@@ -72,15 +92,32 @@ function LogItem({ event }) {
       <span className="log-icon">{icons[event.type] || '📡'}</span>
       <div className="log-content">
         <div className="log-type">{event.type}</div>
-        <div className="log-message">
-          {event.data?.message ||
-           event.data?.agent ||
-           JSON.stringify(event.data).slice(0, 80)}
-        </div>
+        <div className="log-message">{getDisplayMessage()}</div>
         <div className="log-time">
-          {new Date(event.timestamp).toLocaleTimeString()}
+          {event.timestamp
+            ? new Date(event.timestamp).toLocaleTimeString()
+            : ''}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── ARCHITECTURE VIEWER ──
+function ArchitectureViewer({ content }) {
+  if (!content) {
+    return (
+      <div className="empty-state">
+        No architecture yet
+        <br />
+        <small>Run the pipeline to see the Architect's design</small>
+      </div>
+    );
+  }
+
+  return (
+    <div className="architecture-panel">
+      <pre className="architecture-content">{content}</pre>
     </div>
   );
 }
@@ -165,73 +202,103 @@ function TestResults({ report }) {
 // ── MAIN APP ──
 export default function App() {
   const [requirements, setRequirements] = useState(
-    'Build a simple Calculator using MERN stack:\n- Calculator UI with buttons 0-9, +, -, *, /, =, Clear\n- Save each calculation to MongoDB\n- Show calculation history'
+    'Build a simple Todo app using MERN stack:\n- Add a new todo with a text input and Add button\n- Display list of all todos\n- Mark a todo as complete by clicking it\n- Delete a todo with a delete button\n- Save all todos to MongoDB\n- No authentication needed'
   );
-  const [pipelineRunning, setPipelineRunning] = useState(false);
-  const [agentStatuses, setAgentStatuses] = useState({
+  const [pipelineRunning, setPipelineRunning]   = useState(false);
+  const [agentStatuses, setAgentStatuses]       = useState({
     Architect: 'idle',
-    Coder: 'idle',
-    Tester: 'idle'
+    Coder:     'idle',
+    Tester:    'idle'
   });
-  const [iteration, setIteration] = useState(0);
-  const [events, setEvents] = useState([]);
-  const [files, setFiles] = useState([]);
-  const [testReport, setTestReport] = useState(null);
-  const [activeTab, setActiveTab] = useState('logs');
-  const [wsConnected, setWsConnected] = useState(false);
-  const [pipelineStatus, setPipelineStatus] = useState('idle');
+  const [iteration, setIteration]               = useState(0);
+  const [events, setEvents]                     = useState([]);
+  const [files, setFiles]                       = useState([]);
+  const [architecture, setArchitecture]         = useState(null);
+  const [testReport, setTestReport]             = useState(null);
+  const [activeTab, setActiveTab]               = useState('logs');
+  const [wsConnected, setWsConnected]           = useState(false);
+  const [pipelineStatus, setPipelineStatus]     = useState('idle');
 
-  const wsRef = useRef(null);
-  const logsEndRef = useRef(null);
+  const pingIntervalRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const wsRef        = useRef(null);
+  const logsEndRef   = useRef(null);
   const fileInputRef = useRef(null);
 
   // ── WEBSOCKET CONNECTION ──
   useEffect(() => {
     connectWebSocket();
     return () => {
-      if (wsRef.current) wsRef.current.close();
+        // Clean up everything on unmount
+        if (wsRef.current) wsRef.current.close();
+        if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     };
   }, []);
 
-  // Auto scroll logs to bottom
+  // Auto scroll logs to bottom on new events
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [events]);
 
   function connectWebSocket() {
+    // Don't create a new connection if one already exists and is open
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        return;
+    }
+
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      setWsConnected(true);
-      console.log('WebSocket connected');
+        setWsConnected(true);
+        console.log('WebSocket connected');
+
+        // Clear any existing ping interval before creating a new one
+        if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+        }
+
+        // Keep connection alive with ping every 30 seconds
+        pingIntervalRef.current = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 30000);
     };
 
     ws.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      handleWebSocketMessage(message);
+        const message = JSON.parse(event.data);
+        handleWebSocketMessage(message);
     };
 
     ws.onclose = () => {
-      setWsConnected(false);
-      // Reconnect after 3 seconds
-      setTimeout(connectWebSocket, 3000);
+        setWsConnected(false);
+        console.log('WebSocket disconnected — reconnecting in 3s');
+
+        // Clear ping interval when disconnected
+        if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+        }
+
+        // Clear any existing reconnect timer before setting a new one
+        if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+        }
+
+        // Attempt reconnect after 3 seconds
+        reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
     };
 
-    ws.onerror = () => {
-      setWsConnected(false);
+    ws.onerror = (error) => {
+        setWsConnected(false);
+        console.error('WebSocket error:', error);
+        ws.close(); // trigger onclose which handles reconnect
     };
-
-    // Keep alive ping
-    setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send('ping');
-      }
-    }, 30000);
   }
 
   function handleWebSocketMessage(message) {
-    // Add to events log
     setEvents(prev => [...prev.slice(-100), message]);
 
     const { type, data } = message;
@@ -249,15 +316,10 @@ export default function App() {
         [data.agent]: 'complete'
       }));
 
-      // Fetch updated files after Coder completes
-      if (data.agent === 'Coder') {
-        fetchFiles();
-      }
-
-      // Fetch test report after Tester completes
-      if (data.agent === 'Tester') {
-        fetchTestReport();
-      }
+      // Fetch relevant data as each agent completes
+      if (data.agent === 'Architect') fetchArchitecture();
+      if (data.agent === 'Coder')     fetchFiles();
+      if (data.agent === 'Tester')    fetchTestReport();
     }
 
     if (type === 'pipeline_start') {
@@ -266,11 +328,14 @@ export default function App() {
       setIteration(0);
       setAgentStatuses({
         Architect: 'waiting',
-        Coder: 'waiting',
-        Tester: 'waiting'
+        Coder:     'waiting',
+        Tester:    'waiting'
       });
+      // Clear previous run data
       setFiles([]);
+      setArchitecture(null);
       setTestReport(null);
+      setEvents([]);
     }
 
     if (type === 'pipeline_complete') {
@@ -278,12 +343,24 @@ export default function App() {
       setPipelineStatus('complete');
       setIteration(data.iterations || 0);
       fetchFiles();
+      fetchArchitecture();
       fetchTestReport();
     }
 
     if (type === 'pipeline_error') {
       setPipelineRunning(false);
       setPipelineStatus('error');
+    }
+  }
+
+  // ── DATA FETCHERS ──
+
+  async function fetchArchitecture() {
+    try {
+      const response = await axios.get(`${API_URL}/architecture`);
+      setArchitecture(response.data.content || null);
+    } catch (e) {
+      console.error('Failed to fetch architecture:', e);
     }
   }
 
@@ -307,7 +384,6 @@ export default function App() {
 
   async function handleRunPipeline() {
     if (pipelineRunning) return;
-
     try {
       await axios.post(`${API_URL}/run-pipeline`, { requirements });
     } catch (e) {
@@ -322,18 +398,41 @@ export default function App() {
   async function handleFileUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = (event) => {
-      setRequirements(
-        `[Uploaded: ${file.name}]\n\n` + event.target.result
-      );
+      setRequirements(`[Uploaded: ${file.name}]\n\n` + event.target.result);
     };
     reader.readAsText(file);
   }
 
+  // ── TAB DEFINITIONS ──
+  // Centralised so adding a new tab only needs one change here
+  const tabs = [
+    {
+      id:    'logs',
+      label: '📡 Agent Comms',
+      onSelect: () => {}
+    },
+    {
+      id:    'architecture',
+      label: '🏛️ Architecture',
+      onSelect: fetchArchitecture
+    },
+    {
+      id:    'files',
+      label: `📁 Files (${files.length})`,
+      onSelect: fetchFiles
+    },
+    {
+      id:    'tests',
+      label: '🧪 Test Results',
+      onSelect: fetchTestReport
+    },
+  ];
+
   return (
     <div className="app">
+
       {/* ── HEADER ── */}
       <header className="header">
         <div className="header-title">
@@ -351,8 +450,10 @@ export default function App() {
       </header>
 
       <div className="main-grid">
+
         {/* ── LEFT PANEL ── */}
         <div className="left-panel">
+
           {/* Requirements Input */}
           <div className="panel">
             <div className="panel-title">📋 Requirements</div>
@@ -398,57 +499,41 @@ export default function App() {
                 </span>
               )}
             </div>
-            <AgentCard
-              name="Architect"
-              icon="🏛️"
-              status={agentStatuses.Architect}
-            />
-            <AgentCard
-              name="Coder"
-              icon="🔨"
-              status={agentStatuses.Coder}
-            />
-            <AgentCard
-              name="Tester"
-              icon="🧪"
-              status={agentStatuses.Tester}
-            />
+            <AgentCard name="Architect" icon="🏛️" status={agentStatuses.Architect} />
+            <AgentCard name="Coder"     icon="🔨" status={agentStatuses.Coder}     />
+            <AgentCard name="Tester"    icon="🧪" status={agentStatuses.Tester}    />
 
             {pipelineStatus === 'complete' && (
-              <div className="pipeline-complete">
-                🎉 Pipeline Complete!
-              </div>
+              <div className="pipeline-complete">🎉 Pipeline Complete!</div>
             )}
             {pipelineStatus === 'error' && (
-              <div className="pipeline-error">
-                ❌ Pipeline Error
-              </div>
+              <div className="pipeline-error">❌ Pipeline Error</div>
             )}
           </div>
         </div>
 
         {/* ── RIGHT PANEL ── */}
         <div className="right-panel">
+
           {/* Tabs */}
           <div className="tabs">
-            {['logs', 'files', 'tests'].map(tab => (
+            {tabs.map(tab => (
               <button
-                key={tab}
-                className={`tab ${activeTab === tab ? 'active' : ''}`}
+                key={tab.id}
+                className={`tab ${activeTab === tab.id ? 'active' : ''}`}
                 onClick={() => {
-                  setActiveTab(tab);
-                  if (tab === 'files') fetchFiles();
-                  if (tab === 'tests') fetchTestReport();
+                  setActiveTab(tab.id);
+                  tab.onSelect();
                 }}
               >
-                {tab === 'logs' && '📡 Agent Comms'}
-                {tab === 'files' && `📁 Files (${files.length})`}
-                {tab === 'tests' && '🧪 Test Results'}
+                {tab.label}
               </button>
             ))}
           </div>
 
+          {/* Tab Content */}
           <div className="tab-content">
+
             {activeTab === 'logs' && (
               <div className="logs-panel">
                 {events.length === 0 && (
@@ -465,6 +550,10 @@ export default function App() {
               </div>
             )}
 
+            {activeTab === 'architecture' && (
+              <ArchitectureViewer content={architecture} />
+            )}
+
             {activeTab === 'files' && (
               <FileViewer files={files} />
             )}
@@ -472,6 +561,7 @@ export default function App() {
             {activeTab === 'tests' && (
               <TestResults report={testReport} />
             )}
+
           </div>
         </div>
       </div>

@@ -6,43 +6,43 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
-
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tracers.context import tracing_v2_enabled
 
-
 # ── THE BRAIN ──
+# Using Groq for the Architect as well for better
+# reasoning quality and consistent output format
 llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0,
-    max_tokens=4096  # enough for any single file
+    max_tokens=4096
 )
 
 # ── SYSTEM PROMPT ──
-# We now tell the model to return ONLY a JSON block
-# This is called "structured output" - more reliable than tool calling
-# for local models because we control the parsing ourselves
+# Instructs the Architect to return structured JSON
+# so we can reliably parse thinking vs architecture content
 ARCHITECT_SYSTEM_PROMPT = """
 You are an expert software architect specializing in MERN stack applications.
 
-Your job is to analyze requirements and return a JSON response in EXACTLY this format:
+Your job is to analyze software requirements and return a JSON response
+in EXACTLY this format:
 
 {
-  "thinking": "your reasoning about the architecture",
+  "thinking": "your reasoning about the architecture decisions",
   "architecture": "the full markdown content for architecture.md"
 }
 
 The architecture markdown MUST include these sections:
+
 # Project Overview
-(brief description)
+(brief description of the application)
 
 # Frontend React Components
 (list each component with its purpose)
 
 # Backend API Routes
-(method, path, description for each route)
+(method, path, and description for each route)
 
 # MongoDB Schemas
 (each collection with field names and types)
@@ -50,51 +50,55 @@ The architecture markdown MUST include these sections:
 # Folder Structure
 (the complete folder tree)
 
-IMPORTANT: Return ONLY the JSON object. No explanation before or after. No markdown code fences.
+IMPORTANT:
+- Return ONLY the JSON object
+- No explanation before or after
+- No markdown code fences around the JSON
+- Be specific — the Coder agent will read this to generate code
 """
+
 
 def run_architect(requirements: str) -> str:
     """
-    Runs the Architect agent with given requirements.
+    Runs the Architect agent with the given requirements.
+    Accepts any application description — not hardcoded to any app.
     Saves architecture.md to project/ folder.
-    Returns the architecture content.
+    Returns the architecture content as a string.
     """
     print("\n" + "="*50)
     print("ARCHITECT AGENT STARTING")
     print("="*50 + "\n")
 
-    # tracing_v2_enabled gives this trace a meaningful name
-    # in LangSmith instead of showing as "ChatOllama"
-    with tracing_v2_enabled(project_name="parl-agents"):
-        from langchain_core.callbacks import collect_runs
-        messages = [
-            SystemMessage(content=ARCHITECT_SYSTEM_PROMPT),
-            HumanMessage(content=f"Analyze these requirements:\n\n{requirements}")
-        ]
+    messages = [
+        SystemMessage(content=ARCHITECT_SYSTEM_PROMPT),
+        HumanMessage(content=f"Analyze these requirements and produce the architecture:\n\n{requirements}")
+    ]
 
+    print("Thinking", end="", flush=True)
+
+    with tracing_v2_enabled(project_name="parl-agents"):
         response = llm.invoke(
             messages,
             config={
                 "run_name": "Architect Agent",
-                "tags": ["architect", "parl", "phase-1"],
+                "tags": ["architect", "parl"],
                 "metadata": {
                     "agent": "architect",
-                    "model": "llama3.2",
+                    "model": "llama-3.3-70b-versatile",
                     "requirements_length": len(requirements)
                 }
             }
         )
 
-    raw = response.content.strip()
-
     print(" done.\n")
 
-    # ── PARSE THE JSON RESPONSE ──
-    # The model should return a JSON object with "thinking" and "architecture"
-    # We extract both and save the architecture to disk ourselves
+    raw = response.content.strip()
+
+    # ── PARSE JSON RESPONSE ──
+    # Model returns {"thinking": "...", "architecture": "..."}
+    # We extract both fields separately
     try:
-        # Sometimes models wrap JSON in ```json ... ``` fences despite instructions
-        # This strips those out if present
+        # Strip markdown fences if model added them despite instructions
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -111,14 +115,12 @@ def run_architect(requirements: str) -> str:
         print("-" * 40 + "\n")
 
     except json.JSONDecodeError:
-        # If JSON parsing fails, treat the whole response as architecture content
-        # This is the fallback - the model didn't follow instructions perfectly
+        # Fallback — if JSON parsing fails use the raw response
+        # This handles cases where the model ignored formatting instructions
         print("Warning: Could not parse JSON response, using raw output")
         architecture_content = raw
 
     # ── SAVE TO DISK ──
-    # We do this ourselves instead of relying on the model to call a tool
-    # This is more reliable for local models
     os.makedirs("project", exist_ok=True)
     filepath = "project/architecture.md"
 
@@ -140,15 +142,24 @@ def run_architect(requirements: str) -> str:
 
 # ── RUN DIRECTLY TO TEST ──
 if __name__ == "__main__":
-    requirements = """
-    Build a simple Calculator web application using MERN stack:
-    - A clean calculator UI in React with buttons 0-9, +, -, *, /, =, and Clear
-    - Display shows current input and result
-    - Each calculation is saved to MongoDB (expression + result + timestamp)
-    - One Express API route: POST /api/calculations to save a calculation
-    - One Express API route: GET /api/calculations to fetch history
-    - Show calculation history below the calculator
-    Tech stack: MongoDB, Express.js, React, Node.js (MERN)
-    """
+    import sys
 
-    content = run_architect(requirements)
+    # Accept requirements from command line or interactive input
+    if len(sys.argv) > 1:
+        # Example: python agents/architect.py "Build a todo app"
+        requirements = " ".join(sys.argv[1:])
+    else:
+        # Interactive mode — type requirements when prompted
+        print("Enter your application requirements")
+        print("(press Enter twice when done):\n")
+        lines = []
+        while True:
+            line = input()
+            if line == "":
+                if lines:
+                    break
+            else:
+                lines.append(line)
+        requirements = "\n".join(lines)
+
+    run_architect(requirements)
