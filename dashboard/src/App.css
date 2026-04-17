@@ -349,3 +349,22 @@ body {
   padding: 40px 20px;
   line-height: 2;
 }
+
+/* ── ARCHITECTURE PANEL ── */
+.architecture-panel {
+  padding: 16px;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.architecture-content {
+  font-family: 'Segoe UI', sans-serif;
+  font-size: 13px;
+  color: #e0e0e0;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  background: #1a1a2e;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid #2a2a4a;
+}

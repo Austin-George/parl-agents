@@ -174,7 +174,18 @@ class ServerManager:
                 print(f"  Waiting for server... ({i+1}s)")
 
         print("  ✗ Express server failed to start")
-        self._print_server_errors()
+
+        # Print full log content so nothing is missed
+        log_path = "logs/server.log"
+        if os.path.exists(log_path):
+            time.sleep(1)  # wait for log to flush
+            with open(log_path, 'r') as f:
+                full_log = f.read().strip()
+            if full_log:
+                print("\n  Full server log:")
+                print("  " + "\n  ".join(full_log.split('\n')))
+            else:
+                print("  Server log is empty")
         return False
 
     def start_frontend(self) -> bool:
@@ -231,17 +242,39 @@ class ServerManager:
 
     def read_server_errors(self) -> str:
         """
-        Reads logs/server.log and returns lines that contain
-        error indicators. Called by the pipeline to surface
-        runtime crashes back to the Coder agent.
+        Reads server log and returns errors.
+        Returns full log content if server failed to start
+        so no error message gets missed.
         """
-        return self._read_errors(
-            log_path="logs/server.log",
-            indicators=[
+        log_path = "logs/server.log"
+        if not os.path.exists(log_path):
+            return ""
+
+        # Wait a moment for subprocess to finish flushing
+        time.sleep(1)
+
+        with open(log_path, 'r') as f:
+            content = f.read().strip()
+
+        if not content:
+            return "Server produced no output — likely a silent crash"
+
+        # If content is short it's probably just an error message
+        # Return it fully rather than filtering
+        if len(content) < 2000:
+            return content
+
+        # For longer logs filter to just error lines
+        error_lines = [
+            line for line in content.split('\n')
+            if any(ind in line.lower() for ind in [
                 'error', 'cannot find', 'failed',
-                'syntaxerror', 'typeerror', 'referenceerror'
-            ]
-        )
+                'syntaxerror', 'typeerror', 'referenceerror',
+                'unexpected', 'invalid', 'undefined'
+            ])
+        ]
+
+        return '\n'.join(error_lines) if error_lines else content[-1000:]
 
     def read_client_errors(self) -> str:
         """
