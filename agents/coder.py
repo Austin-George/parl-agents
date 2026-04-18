@@ -45,6 +45,8 @@ Return ONLY a JSON array in this exact format:
 Rules:
 - All server files must start with server/
 - All client files must start with client/
+- server should start in port 5000
+- Client should start in port 3000
 - Always include server/package.json and client/package.json
 - Always include server/app.js as Express entry point
 - Always include client/src/index.js and client/src/App.js
@@ -73,15 +75,23 @@ STRICT RULES — violating any of these is unacceptable:
 4. Import paths must be package names only:
    - import express from 'express'          ✓
    - import express from '../node_modules/express'  ✗ never
-5. Use exactly 2 spaces for indentation
-6. No placeholder comments:
+5. For package.json files ONLY use these approved dependencies.
+6. For local files, import paths must be correct relative paths:
+   - If file is client/src/App.js and it imports client/src/components/Component1.js:
+        import Component1 from './components/Component1'  ✓
+        import Component1 from './Component1'             ✗ never
+        import Component1 from '../components/Component1' ✗ never
+7. Should have proper export default for models and routes:
+   - For models: export default ModelName         ✓
+8. Use exactly 2 spaces for indentation
+9. No placeholder comments:
    - // TODO, // add your code, // replace with  ✗ never
-7. For server/app.js ALWAYS include this health check route:
+10. For server/app.js ALWAYS include this health check route:
    app.get('/', (req, res) => res.json({ status: 'ok' }))
-8. ALWAYS end model files with: export default ModelName
-9. ALWAYS end route files with: export default router
-10. Return ONLY the raw file content
-11. No markdown fences, no explanation before or after
+11. ALWAYS end model files with: export default ModelName
+12. ALWAYS end route files with: export default router
+13. Return ONLY the raw file content
+14. No markdown fences, no explanation before or after
 """
 
 
